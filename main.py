@@ -291,7 +291,7 @@ async def main():
     await start_web_server()
     # Запускаем бота
     print("CleanTeam Bot is starting...")
-    bot.infinity_polling(non_stop=True)
+    bot.infinity_polling()
 
 if __name__ == "__main__":
     asyncio.run(main())

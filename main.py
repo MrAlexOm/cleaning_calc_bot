@@ -139,6 +139,10 @@ def start_proc(m):
 
 @bot.message_handler(func=lambda m: m.text in ["Анталья", "Кемер", "Белек"])
 def city_set(m):
+    if m.chat.id not in SESS:
+        handle_start(m)
+        return
+    
     SESS[m.chat.id]["city"] = m.text
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     kb.add("Экспресс", "Поддерживающая", "Генеральная", "VIP", "После ремонта", "Почасовая")
@@ -146,6 +150,10 @@ def city_set(m):
 
 @bot.message_handler(func=lambda m: m.text in ["Экспресс", "Поддерживающая", "Генеральная", "VIP", "После ремонта", "Почасовая"])
 def type_set(m):
+    if m.chat.id not in SESS:
+        handle_start(m)
+        return
+        
     SESS[m.chat.id]["service_type"] = m.text
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=4)
     kb.add("1+0", "1+1", "2+1", "3+1", "4+1", "5+1", "6+1", "7+1")
@@ -153,6 +161,9 @@ def type_set(m):
 
 @bot.message_handler(func=lambda m: m.text in ["1+0","1+1","2+1","3+1","4+1","5+1","6+1","7+1"])
 def layout_set(m):
+    if m.chat.id not in SESS:
+        handle_start(m)
+        return
     SESS[m.chat.id]["layout"] = m.text
     if m.text in ["6+1", "7+1"]:
         bot.send_message(m.chat.id, f"🏢 Большая площадь! Для точного расчета напишите менеджеру: {WHATSAPP_LINK}")
@@ -164,6 +175,9 @@ def layout_set(m):
 
 @bot.message_handler(func=lambda m: m.text in ["<100 м²", ">100 м²"])
 def area_set(m):
+    if m.chat.id not in SESS:
+        handle_start(m)
+        return
     SESS[m.chat.id]["area"] = m.text
     ask_k(m.chat.id)
 
@@ -173,6 +187,9 @@ def ask_k(cid):
 
 @bot.message_handler(func=lambda m: m.text in ["Да, изолированная", "Нет, совмещенная"])
 def k_set(m):
+    if m.chat.id not in SESS:
+        handle_start(m)
+        return
     SESS[m.chat.id]["kitchen_isolated"] = (m.text == "Да, изолированная")
     SESS[m.chat.id]["step"] = "bathrooms"
     bot.send_message(m.chat.id, "🚽 Количество санузлов?", reply_markup=types.ReplyKeyboardRemove())
@@ -258,13 +275,15 @@ def finalize(cid):
 
 @bot.message_handler(func=lambda m: m.text == "✅ Отправить заявку")
 def ask_con(m):
+    if m.chat.id not in SESS:
+        handle_start(m)
+        return
     SESS[m.chat.id]["step"] = "contact"
     bot.send_message(m.chat.id, "📞 Напишите ваш номер WhatsApp для связи:", reply_markup=types.ReplyKeyboardRemove())
 
 @bot.message_handler(func=lambda m: SESS.get(m.chat.id, {}).get("step") == "contact")
 def send_adm(m):
     cid = m.chat.id
-    if cid not in SESS: return
     data = SESS[cid]
     res = data["result"]
     contact = m.text

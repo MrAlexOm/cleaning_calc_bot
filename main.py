@@ -1,15 +1,25 @@
 # -*- coding: utf-8 -*-
 import os
-import asyncio
 import telebot
 from telebot import types
 from telebot.storage import StateMemoryStorage
-from aiohttp import web
+from threading import Thread
+from flask import Flask
 
 # ---------- CONFIG (Берем из настроек Render) ----------
 TOKEN = os.environ.get("BOT_TOKEN", "8162969073:AAFH5BPDIWNHqVuzfzbHrqFZsBTxIsmYpK4")
 ADMIN_ID = os.environ.get("ADMIN_ID", "6181649972")
 WHATSAPP_LINK = "https://wa.me/message/WGW3DA5VHIMTG1"
+
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    return "Cleaning Bot is Live"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
 
 # Константы из твоего кода
 MIN_TRAVEL_PER_PERSON = 1200
@@ -65,20 +75,6 @@ storage = StateMemoryStorage()
 bot = telebot.TeleBot(TOKEN, state_storage=storage)
 SESS = {}
 
-# ---------- ВЕБ-СЕРВЕР ДЛЯ RENDER ----------
-async def handle_hc(request):
-    return web.Response(text="CleanTeam Bot is Live!")
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get("/", handle_hc)
-    app.router.add_get("/healthz", handle_hc)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 10000))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-
 # ---------- ЛОГИКА РАСЧЕТА (Оригинальная) ----------
 
 def calculate_total(chat_id):
@@ -130,7 +126,10 @@ def handle_start(m):
 
 @bot.message_handler(func=lambda m: m.text == "Правила")
 def handle_rules(m):
-    bot.send_message(m.chat.id, "📜 *Краткие правила:*\n• Отмена за 14ч без штрафа.\n• Мин. выезд: 1200₺.\n• Оплата: TRY, IBAN, USDT.", parse_mode="Markdown")
+    bot.send_message(m.chat.id, "📜 *Краткие правила:*
+• Отмена за 14ч без штрафа.
+• Мин. выезд: 1200₺.
+• Оплата: TRY, IBAN, USDT.", parse_mode="Markdown")
 
 @bot.message_handler(func=lambda m: m.text == "СТАРТ")
 def start_proc(m):
@@ -309,12 +308,10 @@ def send_adm(m):
     SESS.pop(cid, None)
 
 # ---------- ГЛАВНЫЙ ЗАПУСК ----------
-async def main():
-    # Запускаем веб-сервер
-    await start_web_server()
-    # Запускаем бота
+if __name__ == "__main__":
+    # Запускаем "жизнеобеспечение" для Render
+    Thread(target=run_flask).start()
+
+    # Твой основной бот со всей его крутой логикой
     print("CleanTeam Bot is starting...")
     bot.infinity_polling()
-
-if __name__ == "__main__":
-    asyncio.run(main())

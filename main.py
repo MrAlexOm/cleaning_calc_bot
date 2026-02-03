@@ -126,10 +126,10 @@ def handle_start(m):
 
 @bot.message_handler(func=lambda m: m.text == "Правила")
 def handle_rules(m):
-    bot.send_message(m.chat.id, "📜 *Краткие правила:*
+    bot.send_message(m.chat.id, """📜 *Краткие правила:*
 • Отмена за 14ч без штрафа.
 • Мин. выезд: 1200₺.
-• Оплата: TRY, IBAN, USDT.", parse_mode="Markdown")
+• Оплата: TRY, IBAN, USDT.""", parse_mode="Markdown")
 
 @bot.message_handler(func=lambda m: m.text == "СТАРТ")
 def start_proc(m):

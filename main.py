@@ -313,5 +313,12 @@ if __name__ == "__main__":
     Thread(target=run_flask).start()
 
     # Твой основной бот со всей его крутой логикой
+    import time
     print("CleanTeam Bot is starting...")
-    bot.infinity_polling()
+    
+    while True:
+        try:
+            bot.infinity_polling()
+        except Exception as e:
+            print(f"An error occurred: {e}. Restarting in 5 seconds...")
+            time.sleep(5)

@@ -5,6 +5,7 @@ from telebot import types
 from telebot.storage import StateMemoryStorage
 from threading import Thread
 from flask import Flask
+from waitress import serve
 
 # ---------- CONFIG (Берем из настроек Render) ----------
 TOKEN = os.environ.get("BOT_TOKEN", "8162969073:AAFH5BPDIWNHqVuzfzbHrqFZsBTxIsmYpK4")
@@ -19,7 +20,7 @@ def index():
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    serve(app, host="0.0.0.0", port=port)
 
 # Константы из твоего кода
 MIN_TRAVEL_PER_PERSON = 1200

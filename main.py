@@ -4,23 +4,28 @@ import telebot
 from telebot import types
 from telebot.storage import StateMemoryStorage
 from threading import Thread
-from flask import Flask
-from waitress import serve
+import asyncio
+import logging
+from aiohttp import web
 
 # ---------- CONFIG (Берем из настроек Render) ----------
 TOKEN = os.environ.get("BOT_TOKEN", "8162969073:AAFH5BPDIWNHqVuzfzbHrqFZsBTxIsmYpK4")
 ADMIN_ID = os.environ.get("ADMIN_ID", "6181649972")
 WHATSAPP_LINK = "https://wa.me/message/WGW3DA5VHIMTG1"
 
-app = Flask(__name__)
+# aiohttp health server
+async def health(request):
+    return web.Response(text="Cleaning Bot is Live")
 
-@app.route('/')
-def index():
-    return "Cleaning Bot is Live"
-
-def run_flask():
+async def start_health_server():
+    app = web.Application()
+    app.router.add_get('/', health)
     port = int(os.environ.get("PORT", 10000))
-    serve(app, host="0.0.0.0", port=port)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host='0.0.0.0', port=port)
+    await site.start()
+    logging.info(f"Health server running on 0.0.0.0:{port}")
 
 # Константы из твоего кода
 MIN_TRAVEL_PER_PERSON = 1200
@@ -309,17 +314,22 @@ def send_adm(m):
     SESS.pop(cid, None)
 
 # ---------- ГЛАВНЫЙ ЗАПУСК ----------
-if __name__ == "__main__":
-    # Запускаем "жизнеобеспечение" для Render
-    Thread(target=run_flask).start()
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    logging.info("CleanTeam Bot is starting...")
 
-    # Твой основной бот со всей его крутой логикой
-    import time
-    print("CleanTeam Bot is starting...")
-    
+    # Запускаем health-сервер до старта опроса
+    asyncio.create_task(start_health_server())
+
+    # Бесконечный защищенный цикл опроса
     while True:
         try:
-            bot.infinity_polling()
+            # infinity_polling блокирующая — выносим в отдельный поток исполнителя
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, bot.infinity_polling)
         except Exception as e:
-            print(f"An error occurred: {e}. Restarting in 5 seconds...")
-            time.sleep(5)
+            logging.error(f"Polling error: {e}")
+            await asyncio.sleep(5)
+
+if __name__ == "__main__":
+    asyncio.run(main())

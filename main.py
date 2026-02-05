@@ -34,7 +34,7 @@ DISTANCE_FEE = {"Кемер": 600, "Белек": 600, "Анталья": 0}
 MAX_DISCOUNT_TL = 1500
 
 PRICES = {
-    "1+0": {"Экспресс": 1400, "Поддерживающая": 1800, "Генеральная": 1400, "VIP": 3000, "После ремонта": 2800},
+    "1+0": {"Экспресс": 1400, "Поддерживающая": 1800, "Генеральная": 2500, "VIP": 3000, "После ремонта": 2800},
     "1+1": {"Экспресс": 1800, "Поддерживающая": 2600, "Генеральная": 3200, "VIP": 4000, "После ремонта": 6400},
     "2+1_low": {"Экспресс": 2200, "Поддерживающая": 3200, "Генеральная": 3900, "VIP": 5600, "После ремонта": 7800},
     "2+1_high": {"Экспресс": 2600, "Поддерживающая": 3800, "Генеральная": 4500, "VIP": 6200, "После ремонта": 9000},
@@ -86,7 +86,8 @@ SESS = {}
 def calculate_total(chat_id):
     data = SESS.get(chat_id, {})
     service = data.get("service_type")
-    if service == "Почасовая": return {"is_hourly": True}
+    if service == "Почасовая":
+        return {"is_hourly": True}
 
     layout = data.get("layout")
     area = data.get("area")
@@ -94,7 +95,8 @@ def calculate_total(chat_id):
     
     temp_layout = layout
     if kitchen_isolated:
-        if layout == "1+0": temp_layout = "1+1"
+        if layout == "1+0":
+            temp_layout = "1+1"
         elif layout in ["1+1", "2+1", "3+1", "4+1"]:
             rooms = int(layout.split("+")[0])
             temp_layout = f"{rooms + 1}+1"
@@ -104,23 +106,63 @@ def calculate_total(chat_id):
         layout_key = "2+1_low" if area == "<100 м²" else "2+1_high"
 
     base_price = PRICES.get(layout_key, {}).get(service, 0)
-    if base_price == 0: return None
+    if base_price == 0:
+        return None
 
+    # Множитель для "После ремонта"
+    repair_multiplier = 2 if service == "После ремонта" else 1
+    base_with_repair = base_price * repair_multiplier
+
+    # Доплаты за санузлы и балконы сверх 1-го
+    bathrooms = int(data.get("bathrooms", "0") or 0)
+    balconies = int(data.get("balconies", "0") or 0)
+    extra_bath_fee = max(0, bathrooms - 1) * 400
+    extra_balcony_fee = max(0, balconies - 1) * 200
+    rooms_surcharge = extra_bath_fee + extra_balcony_fee
+
+    # Подсчет доп. услуг
     extras_p, extras_t = 0, 0
     for name, qty in data.get("extras", []):
         extras_p += EXTRAS[name]["price"] * qty
         extras_t += EXTRAS[name]["time"] * qty
 
-    discounts = data.get("discounts_selected", {})
-    pct = sum([10 if discounts.get("first_order") else 0, 10 if discounts.get("second_order") else 0, 5 if discounts.get("provide_vac") else 0, 5 if discounts.get("provide_cleaners") else 0])
-    disc_amt = min(((base_price + extras_p) * pct) / 100, MAX_DISCOUNT_TL)
+    # База для скидок
+    discounts_base = base_with_repair + rooms_surcharge + extras_p
 
+    # Многоуровневые скидки с лимитами
+    discounts = data.get("discounts_selected", {})
+    disc_first = min(discounts_base * 0.10, 1000) if discounts.get("first_order") else 0
+    disc_second = min(discounts_base * 0.10, 1000) if discounts.get("second_order") else 0
+    disc_vac = min(discounts_base * 0.05, 250) if discounts.get("provide_vac") else 0
+    disc_clean = min(discounts_base * 0.05, 250) if discounts.get("provide_cleaners") else 0
+
+    disc_sum = disc_first + disc_second + disc_vac + disc_clean
+    disc_capped = min(disc_sum, MAX_DISCOUNT_TL)
+
+    # Рекомендации по людям и времени (оставляем прежнюю таблицу)
     rec_c, rec_h = RECOMM_TABLE.get(layout_key, {}).get(service, (1, 4))
     rec_h_total = rec_h + (extras_t / 60 / rec_c)
-    dist_f = DISTANCE_FEE.get(data.get("city"), 0) * rec_c
-    final = max(base_price + extras_p - disc_amt + dist_f, MIN_TRAVEL_PER_PERSON * rec_c)
 
-    return {"base": int(base_price), "extras": int(extras_p), "dist": int(dist_f), "disc": int(disc_amt), "total": int(final), "c": rec_c, "h": round(rec_h_total, 1), "pct": pct, "is_hourly": False}
+    # Итог без учета удаленности, но с минимумом за выезд
+    subtotal = discounts_base - disc_capped
+    subtotal_with_min = max(subtotal, MIN_TRAVEL_PER_PERSON * rec_c)
+
+    # Удаленность: добавляется в самом конце
+    dist_f = DISTANCE_FEE.get(data.get("city"), 0) * rec_c
+    final_total = subtotal_with_min + dist_f
+
+    return {
+        "base": int(base_with_repair),
+        "extras": int(extras_p),
+        "dist": int(dist_f),
+        "disc": int(disc_capped),
+        "rooms_surcharge": int(rooms_surcharge),
+        "total": int(final_total),
+        "c": rec_c,
+        "h": round(rec_h_total, 1),
+        "pct": 0,
+        "is_hourly": False,
+    }
 
 # ---------- ОБРАБОТЧИКИ (Оригинальные) ----------
 

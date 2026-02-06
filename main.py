@@ -3,7 +3,6 @@ import os
 import telebot
 from telebot import types
 from telebot.storage import StateMemoryStorage
-from threading import Thread
 import asyncio
 import logging
 from aiohttp import web
@@ -58,14 +57,8 @@ EXTRAS = {
     "панорамные окна (1 створка)": {"price": 190, "time": 7.5},
     "остекление парапета (1 м)": {"price": 150, "time": 10},
     "мойка холодильника": {"price": 500, "time": 60},
-    "мойка морозильной камеры": {"price": 200, "time": 30},
     "мойка духовки": {"price": 500, "time": 60},
-    "мойка посудомойки": {"price": 200, "time": 30},
-    "мойка стиральной машины": {"price": 150, "time": 30},
-    "мойка лестничного пролета": {"price": 400, "time": 60},
-    "шторы снять+постирать+повесить (1м)": {"price": 100, "time": 6},
     "глажка (1 час)": {"price": 400, "time": 60},
-    "паровая швабра (1 кв.м.)": {"price": 30, "time": 0.5},
 }
 
 NUM_EXTRA_KEYS = {
@@ -81,13 +74,17 @@ storage = StateMemoryStorage()
 bot = telebot.TeleBot(TOKEN, state_storage=storage)
 SESS = {}
 
-# ---------- ЛОГИКА РАСЧЕТА (обновленная для 'После ремонта') ----------
-
+# ---------- ЛОГИКА РАСЧЕТА ----------
 def calculate_total(chat_id):
     data = SESS.get(chat_id, {})
     service = data.get("service_type")
+
     if service == "Почасовая":
-        return {"is_hourly": True}
+        hours = int(data.get("hours", 0))
+        cleaners = int(data.get("cleaners", 1))
+        total = hours * cleaners * HOURLY_RATE
+        dist_f = DISTANCE_FEE.get(data.get("city"), 0) * cleaners
+        return {"total": total + dist_f, "is_hourly": True, "c": cleaners, "h": hours, "dist": dist_f}
 
     layout = data.get("layout")
     area = data.get("area")
@@ -105,302 +102,248 @@ def calculate_total(chat_id):
     if layout_key == "2+1":
         layout_key = "2+1_low" if area == "<100 м²" else "2+1_high"
 
-    # Доплаты за санузлы и балконы сверх 1-го
-    bathrooms = int(data.get("bathrooms", "0") or 0)
-    balconies = int(data.get("balconies", "0") or 0)
+    bathrooms = int(data.get("bathrooms", "1") or 1)
+    balconies = int(data.get("balconies", "1") or 1)
+
     extra_bath_fee = max(0, bathrooms - 1) * 400
     extra_balcony_fee = max(0, balconies - 1) * 200
     rooms_surcharge = extra_bath_fee + extra_balcony_fee
 
-    # Подсчет доп. услуг
     extras_p, extras_t = 0, 0
     for name, qty in data.get("extras", []):
         extras_p += EXTRAS[name]["price"] * qty
         extras_t += EXTRAS[name]["time"] * qty
 
-    # Рекомендации по людям и времени
     rec_c, rec_h = RECOMM_TABLE.get(layout_key, {}).get(service if service != "После ремонта" else "Генеральная", (1, 4))
     rec_h_total = rec_h + (extras_t / 60 / rec_c)
 
-    # Расчет базы
     if service == "После ремонта":
-        # 1) База: берем цену "Генеральная" для данной планировки
         general_base = PRICES.get(layout_key, {}).get("Генеральная", 0)
-        if general_base == 0:
-            return None
-
-        # 2) Формула: (Цена_Генеральной + Стоимость_Доп_Услуг + Доплата_за_санузлы) * 2
         doubled_base = (general_base + extras_p + extra_bath_fee) * 2
-
-        # 3) Скидки считаются от уже умноженной базы
+        
         discounts = data.get("discounts_selected", {})
-        disc_first = min(doubled_base * 0.10, 1000) if discounts.get("first_order") else 0
-        disc_second = min(doubled_base * 0.10, 1000) if discounts.get("second_order") else 0
-        disc_vac = min(doubled_base * 0.05, 250) if discounts.get("provide_vac") else 0
-        disc_clean = min(doubled_base * 0.05, 250) if discounts.get("provide_cleaners") else 0
-        disc_sum = disc_first + disc_second + disc_vac + disc_clean
+        disc_sum = 0
+        if discounts.get("first_order"):
+            disc_sum += min(doubled_base * 0.1, 1000)
+        if discounts.get("second_order"):
+            disc_sum += min(doubled_base * 0.1, 1000)
+        if discounts.get("provide_vac"):
+            disc_sum += min(doubled_base * 0.05, 250)
+        if discounts.get("provide_cleaners"):
+            disc_sum += min(doubled_base * 0.05, 250)
+
         disc_capped = min(disc_sum, MAX_DISCOUNT_TL)
-
-        # 4) Удаленность добавляется в самом конце и не умножается
-        subtotal = max(doubled_base - disc_capped, MIN_TRAVEL_PER_PERSON * rec_c)
         dist_f = DISTANCE_FEE.get(data.get("city"), 0) * rec_c
-        final_total = subtotal + dist_f
+        final_total = max(doubled_base - disc_capped, MIN_TRAVEL_PER_PERSON * rec_c) + dist_f
+        
+        return {"total": int(final_total), "c": rec_c, "h": round(rec_h_total, 1), "dist": int(dist_f), "is_hourly": False}
 
-        return {
-            "base": int(general_base),  # показываем исходную базу "Генеральной"
-            "extras": int(extras_p),
-            "dist": int(dist_f),
-            "disc": int(disc_capped),
-            "rooms_surcharge": int(rooms_surcharge),
-            "total": int(final_total),
-            "c": rec_c,
-            "h": round(rec_h_total, 1),
-            "pct": 0,
-            "is_hourly": False,
-        }
     else:
-        # Обычный расчет для остальных типов услуг (как раньше)
-        base_with_repair = PRICES.get(layout_key, {}).get(service, 0)
-        if base_with_repair == 0:
-            return None
-
-        discounts_base = base_with_repair + rooms_surcharge + extras_p
+        base = PRICES.get(layout_key, {}).get(service, 0)
+        total_base = base + rooms_surcharge + extras_p
 
         discounts = data.get("discounts_selected", {})
-        disc_first = min(discounts_base * 0.10, 1000) if discounts.get("first_order") else 0
-        disc_second = min(discounts_base * 0.10, 1000) if discounts.get("second_order") else 0
-        disc_vac = min(discounts_base * 0.05, 250) if discounts.get("provide_vac") else 0
-        disc_clean = min(discounts_base * 0.05, 250) if discounts.get("provide_cleaners") else 0
+        disc_sum = 0
+        if discounts.get("first_order"):
+            disc_sum += min(total_base * 0.1, 1000)
+        if discounts.get("second_order"):
+            disc_sum += min(total_base * 0.1, 1000)
+        if discounts.get("provide_vac"):
+            disc_sum += min(total_base * 0.05, 250)
+        if discounts.get("provide_cleaners"):
+            disc_sum += min(total_base * 0.05, 250)
 
-        disc_sum = disc_first + disc_second + disc_vac + disc_clean
         disc_capped = min(disc_sum, MAX_DISCOUNT_TL)
-
         dist_f = DISTANCE_FEE.get(data.get("city"), 0) * rec_c
+        final_total = max(total_base - disc_capped, MIN_TRAVEL_PER_PERSON * rec_c) + dist_f
+        
+        return {"total": int(final_total), "c": rec_c, "h": round(rec_h_total, 1), "dist": int(dist_f), "is_hourly": False}
 
-        subtotal = discounts_base - disc_capped
-        subtotal_with_min = max(subtotal, MIN_TRAVEL_PER_PERSON * rec_c)
-
-        final_total = subtotal_with_min + dist_f
-
-        return {
-            "base": int(base_with_repair),
-            "extras": int(extras_p),
-            "dist": int(dist_f),
-            "disc": int(disc_capped),
-            "rooms_surcharge": int(rooms_surcharge),
-            "total": int(final_total),
-            "c": rec_c,
-            "h": round(rec_h_total, 1),
-            "pct": 0,
-            "is_hourly": False,
-        }
-
-# ---------- ОБРАБОТЧИКИ (Оригинальные) ----------
+# ---------- ОБРАБОТЧИКИ ----------
 
 @bot.message_handler(commands=["start"])
 def handle_start(m):
     SESS[m.chat.id] = {"step": "city", "extras": [], "discounts_selected": {}}
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True).add("СТАРТ", "Правила")
-    bot.send_message(m.chat.id, "👋 Привет! Я **Чистюля** — помощник CleanTeam.", parse_mode="Markdown", reply_markup=kb)
-
-@bot.message_handler(func=lambda m: m.text == "Правила")
-def handle_rules(m):
-    rules_text = (
-        "📜 *Основные правила сервиса CleanTeam:*\n\n"
-        "• **Акцепт**: Оформление заказа или оплата означают согласие с договором оферты.\n"
-        "• **Инфо**: Заказчик несет ответственность за точность данных об объекте.\n"
-        "• **Минимальный заказ**: 1200 TL.\n"
-        "• **Отмена**: Бесплатно за 14ч. Менее чем за 14ч — компенсация **1000 TL**.\n"
-        "• **Ожидание**: Первые 30 мин бесплатно, далее **150 TL** за каждые 30 мин.\n"
-        "• **Простой**: Если работа невозможна по вине клиента — **1200 TL**.\n"
-        "• **Приемка**: Все замечания озвучиваются **до оплаты**. Оплата = отсутствие претензий.\n"
-        "• **Оборудование**: Не отвечаем за износ техники клиента или скрытые дефекты."
-    )
-    bot.send_message(m.chat.id, rules_text, parse_mode="Markdown")
+    bot.send_message(m.chat.id, "👋 Привет! Я Чистюля — бот компании CleanTeam.", reply_markup=kb)
 
 @bot.message_handler(func=lambda m: m.text == "СТАРТ")
-def start_proc(m):
+def start_calculation(m):
+    SESS[m.chat.id] = {"step": "city", "extras": [], "discounts_selected": {}}
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True).add("Анталья", "Кемер", "Белек")
     bot.send_message(m.chat.id, "📍 Выберите город:", reply_markup=kb)
 
 @bot.message_handler(func=lambda m: m.text in ["Анталья", "Кемер", "Белек"])
-def city_set(m):
-    if m.chat.id not in SESS:
-        handle_start(m)
-        return
-    
+def set_city(m):
     SESS[m.chat.id]["city"] = m.text
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    kb.add("Экспресс", "Поддерживающая", "Генеральная", "VIP", "После ремонта", "Почасовая")
-    bot.send_message(m.chat.id, "🧹 Тип уборки:", reply_markup=kb)
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2).add(
+        "Экспресс", "Поддерживающая", "Генеральная", "VIP", "После ремонта", "Почасовая"
+    )
+    bot.send_message(m.chat.id, "🧹 Выберите тип уборки:", reply_markup=kb)
 
 @bot.message_handler(func=lambda m: m.text in ["Экспресс", "Поддерживающая", "Генеральная", "VIP", "После ремонта", "Почасовая"])
-def type_set(m):
-    if m.chat.id not in SESS:
-        handle_start(m)
-        return
-        
+def set_service_type(m):
     SESS[m.chat.id]["service_type"] = m.text
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=4)
-    kb.add("1+0", "1+1", "2+1", "3+1", "4+1", "5+1", "6+1", "7+1")
-    bot.send_message(m.chat.id, "🏠 Планировка:", reply_markup=kb)
+    if m.text == "Почасовая":
+        SESS[m.chat.id]["step"] = "hours"
+        bot.send_message(m.chat.id, "⏳ На сколько часов нужна уборка?", reply_markup=types.ReplyKeyboardRemove())
+    else:
+        kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=4).add("1+0", "1+1", "2+1", "3+1", "4+1", "5+1")
+        bot.send_message(m.chat.id, "🏠 Выберите планировку:", reply_markup=kb)
 
-@bot.message_handler(func=lambda m: m.text in ["1+0","1+1","2+1","3+1","4+1","5+1","6+1","7+1"])
-def layout_set(m):
-    if m.chat.id not in SESS:
-        handle_start(m)
-        return
+@bot.message_handler(func=lambda m: m.text in ["1+0", "1+1", "2+1", "3+1", "4+1", "5+1"])
+def set_layout(m):
     SESS[m.chat.id]["layout"] = m.text
-    if m.text in ["6+1", "7+1"]:
-        bot.send_message(m.chat.id, f"🏢 Большая площадь! Для точного расчета н��пишите менеджеру: {WHATSAPP_LINK}")
-        return
     if m.text == "2+1":
         kb = types.ReplyKeyboardMarkup(resize_keyboard=True).add("<100 м²", ">100 м²")
-        bot.send_message(m.chat.id, "📐 Площадь:", reply_markup=kb)
-    else: ask_k(m.chat.id)
+        bot.send_message(m.chat.id, "📐 Укажите площадь квартиры:", reply_markup=kb)
+    else:
+        ask_kitchen(m.chat.id)
 
 @bot.message_handler(func=lambda m: m.text in ["<100 м²", ">100 м²"])
-def area_set(m):
-    if m.chat.id not in SESS:
-        handle_start(m)
-        return
+def set_area(m):
     SESS[m.chat.id]["area"] = m.text
-    ask_k(m.chat.id)
+    ask_kitchen(m.chat.id)
 
-def ask_k(cid):
+def ask_kitchen(chat_id):
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True).add("Да, изолированная", "Нет, совмещенная")
-    bot.send_message(cid, "🍽 Кухня изолированная?", reply_markup=kb)
+    bot.send_message(chat_id, "🍽 Кухня изолированная?", reply_markup=kb)
 
 @bot.message_handler(func=lambda m: m.text in ["Да, изолированная", "Нет, совмещенная"])
-def k_set(m):
-    if m.chat.id not in SESS:
-        handle_start(m)
-        return
+def set_kitchen(m):
     SESS[m.chat.id]["kitchen_isolated"] = (m.text == "Да, изолированная")
     SESS[m.chat.id]["step"] = "bathrooms"
-    bot.send_message(m.chat.id, "🚽 Количество санузлов?", reply_markup=types.ReplyKeyboardRemove())
+    bot.send_message(m.chat.id, "🚽 Сколько санузлов в квартире?", reply_markup=types.ReplyKeyboardRemove())
 
 @bot.message_handler(func=lambda m: SESS.get(m.chat.id, {}).get("step") == "bathrooms")
-def b_set(m):
-    if not m.text.isdigit(): bot.send_message(m.chat.id, "Введите число."); return
+def set_bathrooms(m):
+    if not m.text.isdigit():
+        bot.send_message(m.chat.id, "Пожалуйста, введите число.")
+        return
     SESS[m.chat.id]["bathrooms"] = m.text
     SESS[m.chat.id]["step"] = "balconies"
-    bot.send_message(m.chat.id, "🌅 Количество балконов?")
+    bot.send_message(m.chat.id, "🌅 Сколько балконов/террас?")
 
 @bot.message_handler(func=lambda m: SESS.get(m.chat.id, {}).get("step") == "balconies")
-def bal_set(m):
-    if not m.text.isdigit(): bot.send_message(m.chat.id, "Введите число."); return
+def set_balconies(m):
+    if not m.text.isdigit():
+        bot.send_message(m.chat.id, "Пожалуйста, введите число.")
+        return
     SESS[m.chat.id]["balconies"] = m.text
-    show_ex(m.chat.id)
+    show_extras_menu(m.chat.id)
 
-def show_ex(cid):
-    SESS[cid]["step"] = "extras"
+def show_extras_menu(chat_id):
+    SESS[chat_id]["step"] = "extras"
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    for k in NUM_EXTRA_KEYS: kb.add(k)
-    kb.add("✅ Завершить выбор")
-    bot.send_message(cid, "➕ Доп. услуги:", reply_markup=kb)
+    for key in NUM_EXTRA_KEYS.keys():
+        kb.add(key)
+    kb.add("✅ Завершить выбор доп. услуг")
+    bot.send_message(chat_id, "➕ Добавьте дополнительные услуги (по желанию):", reply_markup=kb)
 
 @bot.message_handler(func=lambda m: SESS.get(m.chat.id, {}).get("step") == "extras")
-def ex_hand(m):
-    if m.text == "✅ Завершить выбор": show_disc(m.chat.id); return
+def handle_extras(m):
+    chat_id = m.chat.id
+    if m.text == "✅ Завершить выбор доп. услуг":
+        show_discounts_menu(chat_id)
+        return
+    
     if m.text in NUM_EXTRA_KEYS:
-        SESS[m.chat.id]["await_extra"] = NUM_EXTRA_KEYS[m.text]
-        SESS[m.chat.id]["step"] = "extra_q"
-        bot.send_message(m.chat.id, f"Кол-во для: {m.text}", reply_markup=types.ReplyKeyboardRemove())
+        SESS[chat_id]["awaiting_qty_for"] = NUM_EXTRA_KEYS[m.text]
+        SESS[chat_id]["step"] = "extra_qty"
+        bot.send_message(chat_id, f"Укажите количество для: {m.text}", reply_markup=types.ReplyKeyboardRemove())
 
-@bot.message_handler(func=lambda m: SESS.get(m.chat.id, {}).get("step") == "extra_q")
-def ex_q_hand(m):
-    if not m.text.isdigit(): return
-    name = SESS[m.chat.id].pop("await_extra")
-    SESS[m.chat.id]["extras"].append((name, int(m.text)))
-    show_ex(m.chat.id)
+@bot.message_handler(func=lambda m: SESS.get(m.chat.id, {}).get("step") == "extra_qty")
+def handle_extra_qty(m):
+    chat_id = m.chat.id
+    if not m.text.isdigit():
+        bot.send_message(chat_id, "Введите число.")
+        return
+    
+    qty = int(m.text)
+    extra_name = SESS[chat_id].pop("awaiting_qty_for")
+    
+    if qty > 0:
+        SESS[chat_id]["extras"].append((extra_name, qty))
+        bot.send_message(chat_id, f"✅ Добавлено: {extra_name} — {qty} шт.")
+    
+    show_extras_menu(chat_id)
 
-def show_disc(cid):
-    SESS[cid]["step"] = "discounts"
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add("Первый заказ -10%", "Каждый второй заказ -10%", "Свой пылесос -5%", "Своя химия -5%", "➡️ К расчету")
-    bot.send_message(cid, "🎁 Скидки:", reply_markup=kb)
+def show_discounts_menu(chat_id):
+    SESS[chat_id]["step"] = "discounts"
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1).add(
+        "Первый заказ -10%",
+        "Каждый второй заказ -10%",
+        "Предоставлю свой пылесос -5%",
+        "Предоставлю свои средства и инвентарь -5%",
+        "➡️ Перейти к расчету стоимости"
+    )
+    bot.send_message(chat_id, "🎁 Выберите доступные скидки:", reply_markup=kb)
 
 @bot.message_handler(func=lambda m: SESS.get(m.chat.id, {}).get("step") == "discounts")
-def disc_hand(m):
+def handle_discounts(m):
     chat = m.chat.id
     sel = SESS[chat]["discounts_selected"]
-    if m.text == "➡️ К расчету":
-        finalize(chat)
+    
+    if m.text == "➡️ Перейти к расчету стоимости":
+        finalize_calculation(chat)
         return
-
-    # Prevent selecting both first and second order discounts
-    if "Первый" in m.text:
-        if sel.get("second_order"):
-            bot.send_message(chat, "⚠️ Скидки на первый и второй заказ не суммируются!")
-            return
+    
+    if "Первый заказ" in m.text:
         sel["first_order"] = True
         bot.send_message(chat, f"✅ Учтено: {m.text}")
-        return
-
-    if "второй" in m.text:
-        if sel.get("first_order"):
-            bot.send_message(chat, "⚠️ Скидки на первый и второй заказ не суммируются!")
-            return
+    elif "второй заказ" in m.text:
         sel["second_order"] = True
         bot.send_message(chat, f"✅ Учтено: {m.text}")
-        return
-
-    if "пылесос" in m.text:
+    elif "пылесос" in m.text:
         sel["provide_vac"] = True
         bot.send_message(chat, f"✅ Учтено: {m.text}")
-        return
-
-    if "химия" in m.text:
+    elif "инвентарь" in m.text:
         sel["provide_cleaners"] = True
         bot.send_message(chat, f"✅ Учтено: {m.text}")
 
-def finalize(cid):
+def finalize_calculation(cid):
     res = calculate_total(cid)
     SESS[cid]["result"] = res
-    SESS[cid]["step"] = "final"
     data = SESS[cid]
-    ext_s = "\n".join([f"• {n}: {q}" for n, q in data["extras"]]) if data["extras"] else "Нет"
     
     if res.get("is_hourly"):
-        price_text = "💰 *ИТОГО: Индивидуальный расчет*"
-        footer = "ℹ️ _Для почасовой уборки стоимость зависит от времени работы. Отправьте заявку для связи с менеджером._"
+        msg = (f"📋 *ВАШ РАСЧЕТ (Почасовая)*\n"
+               f"📍 Город: {data['city']}\n"
+               f"⏳ Время: {res['h']} ч. | 👥 Клинеров: {res['c']}\n"
+               f"🚗 Транспорт: {res['dist']} TL\n"
+               f"💰 *ИТОГО: ~{res['total']} TL*")
     else:
-        price_text_lines = [f"💰 *ИТОГО: ~{res['total']} TL*"]
-        if res.get('dist', 0) > 0:
-            price_text_lines.append(f"_(в т.ч. доплата за удаленность: {res['dist']} TL)_")
-        price_text_lines.append(f"👥 Рекомендуем: {res['c']} чел. на {res['h']} ч.")
-        price_text = "\n".join(price_text_lines)
-        footer = "ℹ️ _Цена предварительная. Конечная стоимость может быть скорректирована на месте._"
+        msg = (f"📋 *ВАШ РАСЧЕТ*\n"
+               f"📍 {data['city']}, {data['layout']}, {data['service_type']}\n"
+               f"🛁 Санузлов: {data['bathrooms']}, Балконов: {data['balconies']}\n")
+        
+        if data["extras"]:
+            msg += "➕ Допы: " + ", ".join([f"{n} ({q})" for n, q in data["extras"]]) + "\n"
+        
+        msg += (f"f\"➖➖➖➖➖➖ \n\""
+                f"💰 *Ориентировочная стоимость: {res['total']} TL*\n"
+                f"f\"➖➖➖➖➖➖ \n\""
+                f"👥 Рекомендуем: {res['c']} чел.\n"
+                f"⏱ Примерное время: {res['h']} ч.")
 
-    msg = (f"📋 *ВАШ РАСЧЕТ*\n"
-           f"📍 {data['city']}, {data['service_type']}, {data['layout']}\n"
-           f"🍽 Кухня изолир: {'Да' if data['kitchen_isolated'] else 'Нет'}\n"
-           f"🛁 {data['bathrooms']} санузла, {data['balconies']} балкона\n"
-           f"➖➖➖➖➖➖\n"
-           f"{price_text}\n"
-           f"➖➖➖➖➖➖\n"
-           f"📝 Допы: {ext_s}\n\n"
-           f"{footer}")
-    
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True).add("✅ Отправить заявку", "🔄 В начало")
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True).add("✅ Отправить заявку менеджеру", "🔄 Начать заново")
     bot.send_message(cid, msg, parse_mode="Markdown", reply_markup=kb)
 
-@bot.message_handler(func=lambda m: m.text == "✅ Отправить заявку")
-def ask_con(m):
-    if m.chat.id not in SESS:
-        handle_start(m)
-        return
-    SESS[m.chat.id]["step"] = "contact"
-    bot.send_message(m.chat.id, "📞 Напишите ваш номер WhatsApp для связи:", reply_markup=types.ReplyKeyboardRemove())
+@bot.message_handler(func=lambda m: m.text == "🔄 Начать заново")
+def restart(m):
+    start_calculation(m)
 
-@bot.message_handler(func=lambda m: SESS.get(m.chat.id, {}).get("step") == "contact")
-def send_adm(m):
+@bot.message_handler(func=lambda m: m.text == "✅ Отправить заявку менеджеру")
+def request_contact(m):
+    SESS[m.chat.id]["step"] = "await_contact"
+    bot.send_message(m.chat.id, "📱 Пожалуйста, введите ваш номер телефона или ник в Telegram для связи:", reply_markup=types.ReplyKeyboardRemove())
+
+@bot.message_handler(func=lambda m: SESS.get(m.chat.id, {}).get("step") == "await_contact")
+def send_to_admin(m):
     cid = m.chat.id
-    data = SESS[cid]
-    res = data["result"]
     contact = m.text
-    price_val = "Почасовая (индивидуально)" if res.get("is_hourly") else f"{res['total']} TL"
+    data = SESS[cid]
+    price_val = data["result"]["total"]
     
     adm_msg = (f"🔔 *НОВАЯ ЗАЯВКА*\n"
                f"👤 Клиент: {contact}\n"
@@ -409,12 +352,12 @@ def send_adm(m):
                f"💰 Сумма: {price_val}")
     try:
         bot.send_message(ADMIN_ID, adm_msg, parse_mode="Markdown")
-        bot.send_message(cid, f"✅ **Заявка принята!**\nМенеджер свяжется с вами.\n\n"
-                             f"📸 [Instagram](https://www.instagram.com/cleanteam.antalya)\n"
-                             f"⚡️ [WhatsApp]({WHATSAPP_LINK})", 
+        bot.send_message(cid, f"✅ **Заявка принята!** \nМенеджер свяжется с вами.\\n\\n"
+                             f"📸 [Instagram](https://www.instagram.com/cleanteam.antalya)\\n"
+                             f"⚡️ [WhatsApp]({WHATSAPP_LINK})",
                              parse_mode="Markdown", reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).add("СТАРТ"))
     except Exception:
-        bot.send_message(cid, f"Ошибка. Свяжитесь: {WHATSAPP_LINK}")
+        bot.send_message(cid, f"Ошибка при отправке. Свяжитесь напрямую: {WHATSAPP_LINK}")
     SESS.pop(cid, None)
 
 # ---------- ГЛАВНЫЙ ЗАПУСК ----------
@@ -428,7 +371,6 @@ async def main():
     # Бесконечный защищенный цикл опроса
     while True:
         try:
-            # infinity_polling блокирующая — выносим в отдельный поток испо��нителя
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, bot.infinity_polling)
         except Exception as e:
@@ -436,4 +378,4 @@ async def main():
             await asyncio.sleep(5)
 
 if __name__ == "__main__":
-    asyncio.run(main())```
+    asyncio.run(main())

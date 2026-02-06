@@ -81,7 +81,7 @@ storage = StateMemoryStorage()
 bot = telebot.TeleBot(TOKEN, state_storage=storage)
 SESS = {}
 
-# ---------- ЛОГИКА РАСЧЕТА (Оригинальная) ----------
+# ---------- ЛОГИКА РАСЧЕТА (обновленная для 'После ремонта') ----------
 
 def calculate_total(chat_id):
     data = SESS.get(chat_id, {})
@@ -92,7 +92,7 @@ def calculate_total(chat_id):
     layout = data.get("layout")
     area = data.get("area")
     kitchen_isolated = data.get("kitchen_isolated", False)
-    
+
     temp_layout = layout
     if kitchen_isolated:
         if layout == "1+0":
@@ -104,11 +104,6 @@ def calculate_total(chat_id):
     layout_key = temp_layout
     if layout_key == "2+1":
         layout_key = "2+1_low" if area == "<100 м²" else "2+1_high"
-
-    # Получаем конечную базовую цену напрямую из PRICES
-    base_with_repair = PRICES.get(layout_key, {}).get(service, 0)
-    if base_with_repair == 0:
-        return None
 
     # Доплаты за санузлы и балконы сверх 1-го
     bathrooms = int(data.get("bathrooms", "0") or 0)
@@ -123,43 +118,82 @@ def calculate_total(chat_id):
         extras_p += EXTRAS[name]["price"] * qty
         extras_t += EXTRAS[name]["time"] * qty
 
-    # База для скидок
-    discounts_base = base_with_repair + rooms_surcharge + extras_p
-
-    # Многоуровневые скидки с лимитами
-    discounts = data.get("discounts_selected", {})
-    disc_first = min(discounts_base * 0.10, 1000) if discounts.get("first_order") else 0
-    disc_second = min(discounts_base * 0.10, 1000) if discounts.get("second_order") else 0
-    disc_vac = min(discounts_base * 0.05, 250) if discounts.get("provide_vac") else 0
-    disc_clean = min(discounts_base * 0.05, 250) if discounts.get("provide_cleaners") else 0
-
-    disc_sum = disc_first + disc_second + disc_vac + disc_clean
-    disc_capped = min(disc_sum, MAX_DISCOUNT_TL)
-
-    # Рекомендации по людям и времени (оставляем прежнюю таблицу)
-    rec_c, rec_h = RECOMM_TABLE.get(layout_key, {}).get(service, (1, 4))
+    # Рекомендации по людям и времени
+    rec_c, rec_h = RECOMM_TABLE.get(layout_key, {}).get(service if service != "После ремонта" else "Генеральная", (1, 4))
     rec_h_total = rec_h + (extras_t / 60 / rec_c)
 
-    # Итог без учета удаленности, но с минимумом за выезд
-    subtotal = discounts_base - disc_capped
-    subtotal_with_min = max(subtotal, MIN_TRAVEL_PER_PERSON * rec_c)
+    # Расчет базы
+    if service == "После ремонта":
+        # 1) База: берем цену "Генеральная" для данной планировки
+        general_base = PRICES.get(layout_key, {}).get("Генеральная", 0)
+        if general_base == 0:
+            return None
 
-    # Удаленность: добавляется в самом конце
-    dist_f = DISTANCE_FEE.get(data.get("city"), 0) * rec_c
-    final_total = subtotal_with_min + dist_f
+        # 2) Формула: (Цена_Генеральной + Стоимость_Доп_Услуг + Доплата_за_санузлы) * 2
+        doubled_base = (general_base + extras_p + extra_bath_fee) * 2
 
-    return {
-        "base": int(base_with_repair),
-        "extras": int(extras_p),
-        "dist": int(dist_f),
-        "disc": int(disc_capped),
-        "rooms_surcharge": int(rooms_surcharge),
-        "total": int(final_total),
-        "c": rec_c,
-        "h": round(rec_h_total, 1),
-        "pct": 0,
-        "is_hourly": False,
-    }
+        # 3) Скидки считаются от уже умноженной базы
+        discounts = data.get("discounts_selected", {})
+        disc_first = min(doubled_base * 0.10, 1000) if discounts.get("first_order") else 0
+        disc_second = min(doubled_base * 0.10, 1000) if discounts.get("second_order") else 0
+        disc_vac = min(doubled_base * 0.05, 250) if discounts.get("provide_vac") else 0
+        disc_clean = min(doubled_base * 0.05, 250) if discounts.get("provide_cleaners") else 0
+        disc_sum = disc_first + disc_second + disc_vac + disc_clean
+        disc_capped = min(disc_sum, MAX_DISCOUNT_TL)
+
+        # 4) Удаленность добавляется в самом конце и не умножается
+        subtotal = max(doubled_base - disc_capped, MIN_TRAVEL_PER_PERSON * rec_c)
+        dist_f = DISTANCE_FEE.get(data.get("city"), 0) * rec_c
+        final_total = subtotal + dist_f
+
+        return {
+            "base": int(general_base),  # показываем исходную базу "Генеральной"
+            "extras": int(extras_p),
+            "dist": int(dist_f),
+            "disc": int(disc_capped),
+            "rooms_surcharge": int(rooms_surcharge),
+            "total": int(final_total),
+            "c": rec_c,
+            "h": round(rec_h_total, 1),
+            "pct": 0,
+            "is_hourly": False,
+        }
+    else:
+        # Обычный расчет для остальных типов услуг (как раньше)
+        base_with_repair = PRICES.get(layout_key, {}).get(service, 0)
+        if base_with_repair == 0:
+            return None
+
+        discounts_base = base_with_repair + rooms_surcharge + extras_p
+
+        discounts = data.get("discounts_selected", {})
+        disc_first = min(discounts_base * 0.10, 1000) if discounts.get("first_order") else 0
+        disc_second = min(discounts_base * 0.10, 1000) if discounts.get("second_order") else 0
+        disc_vac = min(discounts_base * 0.05, 250) if discounts.get("provide_vac") else 0
+        disc_clean = min(discounts_base * 0.05, 250) if discounts.get("provide_cleaners") else 0
+
+        disc_sum = disc_first + disc_second + disc_vac + disc_clean
+        disc_capped = min(disc_sum, MAX_DISCOUNT_TL)
+
+        dist_f = DISTANCE_FEE.get(data.get("city"), 0) * rec_c
+
+        subtotal = discounts_base - disc_capped
+        subtotal_with_min = max(subtotal, MIN_TRAVEL_PER_PERSON * rec_c)
+
+        final_total = subtotal_with_min + dist_f
+
+        return {
+            "base": int(base_with_repair),
+            "extras": int(extras_p),
+            "dist": int(dist_f),
+            "disc": int(disc_capped),
+            "rooms_surcharge": int(rooms_surcharge),
+            "total": int(final_total),
+            "c": rec_c,
+            "h": round(rec_h_total, 1),
+            "pct": 0,
+            "is_hourly": False,
+        }
 
 # ---------- ОБРАБОТЧИКИ (Оригинальные) ----------
 
@@ -218,7 +252,7 @@ def layout_set(m):
         return
     SESS[m.chat.id]["layout"] = m.text
     if m.text in ["6+1", "7+1"]:
-        bot.send_message(m.chat.id, f"🏢 Большая площадь! Для точного расчета напишите менеджеру: {WHATSAPP_LINK}")
+        bot.send_message(m.chat.id, f"🏢 Большая площадь! Для точного расчета н��пишите менеджеру: {WHATSAPP_LINK}")
         return
     if m.text == "2+1":
         kb = types.ReplyKeyboardMarkup(resize_keyboard=True).add("<100 м²", ">100 м²")
@@ -394,7 +428,7 @@ async def main():
     # Бесконечный защищенный цикл опроса
     while True:
         try:
-            # infinity_polling блокирующая — выносим в отдельный поток исполнителя
+            # infinity_polling блокирующая — выносим в отдельный поток испо��нителя
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, bot.infinity_polling)
         except Exception as e:
@@ -402,4 +436,11 @@ async def main():
             await asyncio.sleep(5)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main())```
+
+
+Примечания:
+- Для “После ремонта” база берется как цена “Генеральная” для соответствующей планировки (с учетом кухни/площади).
+- Итоговая база удваивается после суммирования general_base + extras + доплата за санузлы.
+- Скидки считаются от удвоенной базы и ограничиваются MAX_DISCOUNT_TL; затем применяется минималка за выезд и только в конце добавляется дистанция.
+- В disc_hand логика взаимного исключения для “Первый за��аз” и “Каждый второй заказ” сохранена.

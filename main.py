@@ -105,13 +105,10 @@ def calculate_total(chat_id):
     if layout_key == "2+1":
         layout_key = "2+1_low" if area == "<100 м²" else "2+1_high"
 
-    base_price = PRICES.get(layout_key, {}).get(service, 0)
-    if base_price == 0:
+    # Получаем конечную базовую цену напрямую из PRICES
+    base_with_repair = PRICES.get(layout_key, {}).get(service, 0)
+    if base_with_repair == 0:
         return None
-
-    # Множитель для "После ремонта"
-    repair_multiplier = 2 if service == "После ремонта" else 1
-    base_with_repair = base_price * repair_multiplier
 
     # Доплаты за санузлы и балконы сверх 1-го
     bathrooms = int(data.get("bathrooms", "0") or 0)
@@ -294,12 +291,35 @@ def show_disc(cid):
 def disc_hand(m):
     chat = m.chat.id
     sel = SESS[chat]["discounts_selected"]
-    if m.text == "➡️ К расчету": finalize(chat); return
-    elif "Первый" in m.text: sel["first_order"] = True
-    elif "второй" in m.text: sel["second_order"] = True
-    elif "пылесос" in m.text: sel["provide_vac"] = True
-    elif "химия" in m.text: sel["provide_cleaners"] = True
-    bot.send_message(chat, f"✅ Учтено: {m.text}")
+    if m.text == "➡️ К расчету":
+        finalize(chat)
+        return
+
+    # Prevent selecting both first and second order discounts
+    if "Первый" in m.text:
+        if sel.get("second_order"):
+            bot.send_message(chat, "⚠️ Скидки на первый и второй заказ не суммируются!")
+            return
+        sel["first_order"] = True
+        bot.send_message(chat, f"✅ Учтено: {m.text}")
+        return
+
+    if "второй" in m.text:
+        if sel.get("first_order"):
+            bot.send_message(chat, "⚠️ Скидки на первый и второй заказ не суммируются!")
+            return
+        sel["second_order"] = True
+        bot.send_message(chat, f"✅ Учтено: {m.text}")
+        return
+
+    if "пылесос" in m.text:
+        sel["provide_vac"] = True
+        bot.send_message(chat, f"✅ Учтено: {m.text}")
+        return
+
+    if "химия" in m.text:
+        sel["provide_cleaners"] = True
+        bot.send_message(chat, f"✅ Учтено: {m.text}")
 
 def finalize(cid):
     res = calculate_total(cid)

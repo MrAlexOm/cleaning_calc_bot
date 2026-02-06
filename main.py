@@ -6,6 +6,9 @@ from telebot.storage import StateMemoryStorage
 import asyncio
 import logging
 from aiohttp import web
+import time
+from requests.exceptions import ConnectionError as RequestsConnectionError, ReadTimeout
+from urllib3.exceptions import ProtocolError
 
 # ---------- CONFIG (Берем из настроек Render) ----------
 TOKEN = os.environ.get("BOT_TOKEN", "8162969073:AAFH5BPDIWNHqVuzfzbHrqFZsBTxIsmYpK4")
@@ -73,6 +76,26 @@ NUM_EXTRA_KEYS = {
 storage = StateMemoryStorage()
 bot = telebot.TeleBot(TOKEN, state_storage=storage)
 SESS = {}
+
+# Безопасная отправка сообщений с повторными попытками на случай сетевых сбоев
+
+def send_safe(chat_id, text, parse_mode=None, reply_markup=None, max_retries=3):
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            return bot.send_message(chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
+        except (RequestsConnectionError, ReadTimeout, ProtocolError) as e:
+            last_err = e
+            logging.warning(f"send_safe retry {attempt+1}/{max_retries} due to network error: {e}")
+            time.sleep(0.3)
+        except Exception as e:
+            logging.error(f"send_safe aborted due to non-network error: {e}")
+            break
+    try:
+        return bot.send_message(chat_id, text)
+    except Exception as e:
+        logging.error(f"send_safe final failure: {e} | last network err: {last_err}")
+        return None
 
 # ---------- ЛОГИКА РАСЧЕТА ----------
 def calculate_total(chat_id):
@@ -165,13 +188,13 @@ def calculate_total(chat_id):
 def handle_start(m):
     SESS[m.chat.id] = {"step": "city", "extras": [], "discounts_selected": {}}
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True).add("СТАРТ", "Правила")
-    bot.send_message(m.chat.id, "👋 Привет! Я Чистюля — бот компании CleanTeam.", reply_markup=kb)
+    send_safe(m.chat.id, "👋 Привет! Я Чистюля — бот компании CleanTeam.", reply_markup=kb)
 
 @bot.message_handler(func=lambda m: m.text == "СТАРТ")
 def start_calculation(m):
     SESS[m.chat.id] = {"step": "city", "extras": [], "discounts_selected": {}}
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True).add("Анталья", "Кемер", "Белек")
-    bot.send_message(m.chat.id, "📍 Выберите город:", reply_markup=kb)
+    send_safe(m.chat.id, "📍 Выберите город:", reply_markup=kb)
 
 @bot.message_handler(func=lambda m: m.text in ["Анталья", "Кемер", "Белек"])
 def set_city(m):
@@ -290,10 +313,16 @@ def handle_discounts(m):
     
     if "Первый заказ" in m.text:
         sel["first_order"] = True
-        bot.send_message(chat, f"✅ Учтено: {m.text}")
+        if sel.get("second_order"):
+            sel.pop("second_order", None)
+            send_safe(chat, "⚠️ Скидки 'Первый заказ' и 'Каждый второй заказ' взаимоисключают друг друга. Применена 'Первый заказ'.")
+        send_safe(chat, f"✅ Учтено: {m.text}")
     elif "второй заказ" in m.text:
         sel["second_order"] = True
-        bot.send_message(chat, f"✅ Учтено: {m.text}")
+        if sel.get("first_order"):
+            sel.pop("first_order", None)
+            send_safe(chat, "⚠️ Скидки 'Первый заказ' и 'Каждый второй заказ' взаимоисключают друг друга. Применена 'Каждый второй заказ'.")
+        send_safe(chat, f"✅ Учтено: {m.text}")
     elif "пылесос" in m.text:
         sel["provide_vac"] = True
         bot.send_message(chat, f"✅ Учтено: {m.text}")
@@ -320,14 +349,14 @@ def finalize_calculation(cid):
         if data["extras"]:
             msg += "➕ Допы: " + ", ".join([f"{n} ({q})" for n, q in data["extras"]]) + "\n"
         
-        msg += (f"f\"➖➖➖➖➖➖ \n\""
+        msg += ("➖➖➖➖➖➖ \n"
                 f"💰 *Ориентировочная стоимость: {res['total']} TL*\n"
-                f"f\"➖➖➖➖➖➖ \n\""
+                "➖➖➖➖➖➖ \n"
                 f"👥 Рекомендуем: {res['c']} чел.\n"
                 f"⏱ Примерное время: {res['h']} ч.")
 
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True).add("✅ Отправить заявку менеджеру", "🔄 Начать заново")
-    bot.send_message(cid, msg, parse_mode="Markdown", reply_markup=kb)
+    send_safe(cid, msg, parse_mode="Markdown", reply_markup=kb)
 
 @bot.message_handler(func=lambda m: m.text == "🔄 Начать заново")
 def restart(m):
@@ -342,22 +371,29 @@ def request_contact(m):
 def send_to_admin(m):
     cid = m.chat.id
     contact = m.text
-    data = SESS[cid]
-    price_val = data["result"]["total"]
+    data = SESS.get(cid) or {}
+
+    # Проверка наличия результата расчета
+    if not data or "result" not in data:
+        send_safe(cid, "Расчет не найден или устарел. Пожалуйста, начните расчет заново.", reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).add("СТАРТ"))
+        return
+
+    price_val = data["result"].get("total")
     
     adm_msg = (f"🔔 *НОВАЯ ЗАЯВКА*\n"
                f"👤 Клиент: {contact}\n"
                f"📍 {data['city']}, {data['layout']}, {data['service_type']}\n"
-               f"🛁 Санузлов: {data['bathrooms']}, Балконов: {data['balconies']}\n"
+               f"🛁 Санузлов: {data['bathrooms']}, Балконов: {data['balконов']}\n"
                f"💰 Сумма: {price_val}")
     try:
-        bot.send_message(ADMIN_ID, adm_msg, parse_mode="Markdown")
-        bot.send_message(cid, f"✅ **Заявка принята!** \nМенеджер свяжется с вами.\\n\\n"
-                             f"📸 [Instagram](https://www.instagram.com/cleanteam.antalya)\\n"
-                             f"⚡️ [WhatsApp]({WHATSAPP_LINK})",
-                             parse_mode="Markdown", reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).add("СТАРТ"))
+        send_safe(ADMIN_ID, adm_msg, parse_mode="Markdown")
+        send_safe(cid, (
+            "✅ **Заявка принята!** \nМенеджер свяжется с вами.\n\n"
+            f"📸 [Instagram](https://www.instagram.com/cleanteam.antalya)\n"
+            f"⚡️ [WhatsApp]({WHATSAPP_LINK})"
+        ), parse_mode="Markdown", reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).add("СТАРТ"))
     except Exception:
-        bot.send_message(cid, f"Ошибка при отправке. Свяжитесь напрямую: {WHATSAPP_LINK}")
+        send_safe(cid, f"Ошибка при отправке. Свяжитесь напрямую: {WHATSAPP_LINK}")
     SESS.pop(cid, None)
 
 # ---------- ГЛАВНЫЙ ЗАПУСК ----------

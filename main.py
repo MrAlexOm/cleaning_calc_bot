@@ -29,7 +29,7 @@ async def start_health_server():
     await site.start()
     logging.info(f"Health server running on 0.0.0.0:{port}")
 
-# Константы из твоего кода
+# Константы
 MIN_TRAVEL_PER_PERSON = 1200
 HOURLY_RATE = 450
 DISTANCE_FEE = {"Кемер": 600, "Белек": 600, "Анталья": 0}
@@ -77,25 +77,13 @@ storage = StateMemoryStorage()
 bot = telebot.TeleBot(TOKEN, state_storage=storage)
 SESS = {}
 
-# Безопасная отправка сообщений с повторными попытками на случай сетевых сбоев
-
 def send_safe(chat_id, text, parse_mode=None, reply_markup=None, max_retries=3):
-    last_err = None
     for attempt in range(max_retries):
         try:
-            return bot.send_message(chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
-        except (RequestsConnectionError, ReadTimeout, ProtocolError) as e:
-            last_err = e
-            logging.warning(f"send_safe retry {attempt+1}/{max_retries} due to network error: {e}")
+            return bot.send_message(chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup, disable_web_page_preview=True)
+        except Exception:
             time.sleep(0.3)
-        except Exception as e:
-            logging.error(f"send_safe aborted due to non-network error: {e}")
-            break
-    try:
-        return bot.send_message(chat_id, text)
-    except Exception as e:
-        logging.error(f"send_safe final failure: {e} | last network err: {last_err}")
-        return None
+    return None
 
 # ---------- ЛОГИКА РАСЧЕТА ----------
 def calculate_total(chat_id):
@@ -115,8 +103,7 @@ def calculate_total(chat_id):
 
     temp_layout = layout
     if kitchen_isolated:
-        if layout == "1+0":
-            temp_layout = "1+1"
+        if layout == "1+0": temp_layout = "1+1"
         elif layout in ["1+1", "2+1", "3+1", "4+1"]:
             rooms = int(layout.split("+")[0])
             temp_layout = f"{rooms + 1}+1"
@@ -125,8 +112,8 @@ def calculate_total(chat_id):
     if layout_key == "2+1":
         layout_key = "2+1_low" if area == "<100 м²" else "2+1_high"
 
-    bathrooms = int(data.get("bathrooms", "1") or 1)
-    balconies = int(data.get("balconies", "1") or 1)
+    bathrooms = int(data.get("bathrooms", "1"))
+    balconies = int(data.get("balconies", "1"))
 
     extra_bath_fee = max(0, bathrooms - 1) * 400
     extra_balcony_fee = max(0, balconies - 1) * 200
@@ -140,47 +127,26 @@ def calculate_total(chat_id):
     rec_c, rec_h = RECOMM_TABLE.get(layout_key, {}).get(service if service != "После ремонта" else "Генеральная", (1, 4))
     rec_h_total = rec_h + (extras_t / 60 / rec_c)
 
+    base_price_key = service if service != "После ремонта" else "Генеральная"
+    base = PRICES.get(layout_key, {}).get(base_price_key, 0)
+    
     if service == "После ремонта":
-        general_base = PRICES.get(layout_key, {}).get("Генеральная", 0)
-        doubled_base = (general_base + extras_p + extra_bath_fee) * 2
-        
-        discounts = data.get("discounts_selected", {})
-        disc_sum = 0
-        if discounts.get("first_order"):
-            disc_sum += min(doubled_base * 0.1, 1000)
-        if discounts.get("second_order"):
-            disc_sum += min(doubled_base * 0.1, 1000)
-        if discounts.get("provide_vac"):
-            disc_sum += min(doubled_base * 0.05, 250)
-        if discounts.get("provide_cleaners"):
-            disc_sum += min(doubled_base * 0.05, 250)
+        base = base * 2 # Удваиваем базу для ремонта
 
-        disc_capped = min(disc_sum, MAX_DISCOUNT_TL)
-        dist_f = DISTANCE_FEE.get(data.get("city"), 0) * rec_c
-        final_total = max(doubled_base - disc_capped, MIN_TRAVEL_PER_PERSON * rec_c) + dist_f
-        
-        return {"total": int(final_total), "c": rec_c, "h": round(rec_h_total, 1), "dist": int(dist_f), "is_hourly": False}
+    total_base = base + rooms_surcharge + extras_p
 
-    else:
-        base = PRICES.get(layout_key, {}).get(service, 0)
-        total_base = base + rooms_surcharge + extras_p
+    discounts = data.get("discounts_selected", {})
+    disc_sum = 0
+    if discounts.get("first_order"): disc_sum += min(total_base * 0.1, 1000)
+    if discounts.get("second_order"): disc_sum += min(total_base * 0.1, 1000)
+    if discounts.get("provide_vac"): disc_sum += min(total_base * 0.05, 250)
+    if discounts.get("provide_cleaners"): disc_sum += min(total_base * 0.05, 250)
 
-        discounts = data.get("discounts_selected", {})
-        disc_sum = 0
-        if discounts.get("first_order"):
-            disc_sum += min(total_base * 0.1, 1000)
-        if discounts.get("second_order"):
-            disc_sum += min(total_base * 0.1, 1000)
-        if discounts.get("provide_vac"):
-            disc_sum += min(total_base * 0.05, 250)
-        if discounts.get("provide_cleaners"):
-            disc_sum += min(total_base * 0.05, 250)
-
-        disc_capped = min(disc_sum, MAX_DISCOUNT_TL)
-        dist_f = DISTANCE_FEE.get(data.get("city"), 0) * rec_c
-        final_total = max(total_base - disc_capped, MIN_TRAVEL_PER_PERSON * rec_c) + dist_f
-        
-        return {"total": int(final_total), "c": rec_c, "h": round(rec_h_total, 1), "dist": int(dist_f), "is_hourly": False}
+    disc_capped = min(disc_sum, MAX_DISCOUNT_TL)
+    dist_f = DISTANCE_FEE.get(data.get("city"), 0) * rec_c
+    final_total = max(total_base - disc_capped, MIN_TRAVEL_PER_PERSON * rec_c) + dist_f
+    
+    return {"total": int(final_total), "c": rec_c, "h": round(rec_h_total, 1), "dist": int(dist_f), "is_hourly": False}
 
 # ---------- ОБРАБОТЧИКИ ----------
 
@@ -211,7 +177,7 @@ def set_service_type(m):
         SESS[m.chat.id]["step"] = "hours"
         bot.send_message(m.chat.id, "⏳ На сколько часов нужна уборка?", reply_markup=types.ReplyKeyboardRemove())
     else:
-        kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=4).add("1+0", "1+1", "2+1", "3+1", "4+1", "5+1")
+        kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=3).add("1+0", "1+1", "2+1", "3+1", "4+1", "5+1")
         bot.send_message(m.chat.id, "🏠 Выберите планировку:", reply_markup=kb)
 
 @bot.message_handler(func=lambda m: m.text in ["1+0", "1+1", "2+1", "3+1", "4+1", "5+1"])
@@ -269,7 +235,6 @@ def handle_extras(m):
     if m.text == "✅ Завершить выбор доп. услуг":
         show_discounts_menu(chat_id)
         return
-    
     if m.text in NUM_EXTRA_KEYS:
         SESS[chat_id]["awaiting_qty_for"] = NUM_EXTRA_KEYS[m.text]
         SESS[chat_id]["step"] = "extra_qty"
@@ -281,23 +246,18 @@ def handle_extra_qty(m):
     if not m.text.isdigit():
         bot.send_message(chat_id, "Введите число.")
         return
-    
     qty = int(m.text)
-    extra_name = SESS[chat_id].pop("awaiting_qty_for")
-    
+    extra_name = SESS[chat_id].pop("awaiting_qty_for", "услуга")
     if qty > 0:
         SESS[chat_id]["extras"].append((extra_name, qty))
         bot.send_message(chat_id, f"✅ Добавлено: {extra_name} — {qty} шт.")
-    
     show_extras_menu(chat_id)
 
 def show_discounts_menu(chat_id):
     SESS[chat_id]["step"] = "discounts"
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1).add(
-        "Первый заказ -10%",
-        "Каждый второй заказ -10%",
-        "Предоставлю свой пылесос -5%",
-        "Предоставлю свои средства и инвентарь -5%",
+        "Первый заказ -10%", "Каждый второй заказ -10%",
+        "Предоставлю свой пылесос -5%", "Предоставлю свои средства и инвентарь -5%",
         "➡️ Перейти к расчету стоимости"
     )
     bot.send_message(chat_id, "🎁 Выберите доступные скидки:", reply_markup=kb)
@@ -306,29 +266,23 @@ def show_discounts_menu(chat_id):
 def handle_discounts(m):
     chat = m.chat.id
     sel = SESS[chat]["discounts_selected"]
-    
     if m.text == "➡️ Перейти к расчету стоимости":
         finalize_calculation(chat)
         return
-    
     if "Первый заказ" in m.text:
         sel["first_order"] = True
-        if sel.get("second_order"):
-            sel.pop("second_order", None)
-            send_safe(chat, "⚠️ Скидки 'Первый заказ' и 'Каждый второй заказ' взаимоисключают друг друга. Применена 'Первый заказ'.")
-        send_safe(chat, f"✅ Учтено: {m.text}")
+        sel.pop("second_order", None)
+        send_safe(chat, "✅ Учтено: -10%")
     elif "второй заказ" in m.text:
         sel["second_order"] = True
-        if sel.get("first_order"):
-            sel.pop("first_order", None)
-            send_safe(chat, "⚠️ Скидки 'Первый заказ' и 'Каждый второй заказ' взаимоисключают друг друга. Применена 'Каждый второй заказ'.")
-        send_safe(chat, f"✅ Учтено: {m.text}")
+        sel.pop("first_order", None)
+        send_safe(chat, "✅ Учтено: -10%")
     elif "пылесос" in m.text:
         sel["provide_vac"] = True
-        bot.send_message(chat, f"✅ Учтено: {m.text}")
+        send_safe(chat, "✅ Учтено: -5%")
     elif "инвентарь" in m.text:
         sel["provide_cleaners"] = True
-        bot.send_message(chat, f"✅ Учтено: {m.text}")
+        send_safe(chat, "✅ Учтено: -5%")
 
 def finalize_calculation(cid):
     res = calculate_total(cid)
@@ -344,11 +298,9 @@ def finalize_calculation(cid):
     else:
         msg = (f"📋 *ВАШ РАСЧЕТ*\n"
                f"📍 {data['city']}, {data['layout']}, {data['service_type']}\n"
-               f"🛁 Санузлов: {data['bathrooms']}, Балконов: {data['balconies']}\n")
-        
-        if data["extras"]:
+               f"🛁 Санузлов: {data.get('bathrooms', '1')}, Балконов: {data.get('balconies', '1')}\n")
+        if data.get("extras"):
             msg += "➕ Допы: " + ", ".join([f"{n} ({q})" for n, q in data["extras"]]) + "\n"
-        
         msg += ("➖➖➖➖➖➖ \n"
                 f"💰 *Ориентировочная стоимость: {res['total']} TL*\n"
                 "➖➖➖➖➖➖ \n"
@@ -360,7 +312,9 @@ def finalize_calculation(cid):
 
 @bot.message_handler(func=lambda m: m.text == "🔄 Начать заново")
 def restart(m):
-    start_calculation(m)
+    SESS[m.chat.id] = {"step": "city", "extras": [], "discounts_selected": {}}
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True).add("Анталья", "Кемер", "Белек")
+    send_safe(m.chat.id, "🔄 Расчет сброшен. Начнем заново!\n\n📍 Выберите город:", reply_markup=kb)
 
 @bot.message_handler(func=lambda m: m.text == "✅ Отправить заявку менеджеру")
 def request_contact(m):
@@ -371,47 +325,37 @@ def request_contact(m):
 def send_to_admin(m):
     cid = m.chat.id
     contact = m.text
-    data = SESS.get(cid) or {}
-
-    # Проверка наличия результата расчета
+    data = SESS.get(cid)
     if not data or "result" not in data:
-        send_safe(cid, "Расчет не найден или устарел. Пожалуйста, начните расчет заново.", reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).add("СТАРТ"))
+        send_safe(cid, "⚠️ Ошибка: данные утеряны.", reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).add("СТАРТ"))
         return
 
-    price_val = data["result"].get("total")
-    
+    res = data["result"]
     adm_msg = (f"🔔 *НОВАЯ ЗАЯВКА*\n"
                f"👤 Клиент: {contact}\n"
-               f"📍 {data['city']}, {data['layout']}, {data['service_type']}\n"
-               f"🛁 Санузлов: {data['bathrooms']}, Балконов: {data['balконов']}\n"
-               f"💰 Сумма: {price_val}")
+               f"📍 {data.get('city')}, {data.get('layout', 'Почасовая')}, {data.get('service_type')}\n"
+               f"🛁 Санузлов: {data.get('bathrooms', '-')}, Балконов: {data.get('balconies', '-')}\n"
+               f"💰 Сумма: {res.get('total')} TL")
+    
     try:
         send_safe(ADMIN_ID, adm_msg, parse_mode="Markdown")
-        send_safe(cid, (
-            "✅ **Заявка принята!** \nМенеджер свяжется с вами.\n\n"
-            f"📸 [Instagram](https://www.instagram.com/cleanteam.antalya)\n"
-            f"⚡️ [WhatsApp]({WHATSAPP_LINK})"
-        ), parse_mode="Markdown", reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).add("СТАРТ"))
+        client_msg = (f"✅ **Заявка принята!**\nМенеджер свяжется с вами.\n\n"
+                      f"📸 [Instagram](https://www.instagram.com/cleanteam.antalya)\n"
+                      f"⚡️ [WhatsApp]({WHATSAPP_LINK})")
+        send_safe(cid, client_msg, parse_mode="Markdown", reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).add("СТАРТ"))
     except Exception:
-        send_safe(cid, f"Ошибка при отправке. Свяжитесь напрямую: {WHATSAPP_LINK}")
+        send_safe(cid, f"Ошибка при отправке. Напишите нам: {WHATSAPP_LINK}")
     SESS.pop(cid, None)
 
-# ---------- ГЛАВНЫЙ ЗАПУСК ----------
 async def main():
     logging.basicConfig(level=logging.INFO)
-    logging.info("CleanTeam Bot is starting...")
-
-    # Запускаем health-сервер до старта опроса
     asyncio.create_task(start_health_server())
-
-    # Бесконечный защищенный цикл опроса
     while True:
         try:
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, bot.infinity_polling)
-        except Exception as e:
-            logging.error(f"Polling error: {e}")
+            bot.infinity_polling(timeout=20, long_polling_timeout=10)
+        except Exception:
             await asyncio.sleep(5)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try: asyncio.run(main())
+    except KeyboardInterrupt: pass

@@ -310,9 +310,12 @@ def finalize_calculation(cid):
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True).add("✅ Отправить заявку менеджеру", "🔄 Начать заново")
     send_safe(cid, msg, parse_mode="Markdown", reply_markup=kb)
 
+# ИСПРАВЛЕННЫЙ ОБРАБОТЧИК КНОПКИ "НАЧАТЬ ЗАНОВО"
 @bot.message_handler(func=lambda m: m.text == "🔄 Начать заново")
 def restart(m):
+    # 1. Полностью очищаем сессию пользователя
     SESS[m.chat.id] = {"step": "city", "extras": [], "discounts_selected": {}}
+    # 2. Вызываем стартовое меню выбора города
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True).add("Анталья", "Кемер", "Белек")
     send_safe(m.chat.id, "🔄 Расчет сброшен. Начнем заново!\n\n📍 Выберите город:", reply_markup=kb)
 

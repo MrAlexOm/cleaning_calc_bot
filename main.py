@@ -10,7 +10,7 @@ import time
 from requests.exceptions import ConnectionError as RequestsConnectionError, ReadTimeout
 from urllib3.exceptions import ProtocolError
 
-# 1. GLOBAL LOGGING (Fixed: Must be at the very top)
+# 1. GLOBAL LOGGING
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'

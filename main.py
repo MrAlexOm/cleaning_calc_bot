@@ -181,6 +181,14 @@ def handle_rules(m):
     )
     send_safe(m.chat.id, rules, parse_mode="Markdown")
 
+@bot.message_handler(func=lambda m: m.text == "✅ Заказать")
+def get_contact(m):
+    SESS[m.chat.id]["step"] = "contact"
+    bot.send_message(m.chat.id, "📞 Введите ваш телефон или @username:", reply_markup=types.ReplyKeyboardRemove())
+
+@bot.message_handler(func=lambda m: m.text == "🔄 Заново")
+def restart(m): handle_start(m)
+
 @bot.message_handler(func=lambda m: m.text == "СТАРТ")
 def start_calc(m):
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True).add("Анталья", "Кемер", "Белек")
@@ -270,8 +278,11 @@ def show_discounts(cid):
 @bot.message_handler(func=lambda m: SESS.get(m.chat.id, {}).get("step") == "discounts")
 def handle_disc(m):
     cid = m.chat.id
-    if "РЕЗУЛЬТАТ" in m.text: finalize(cid)
-    elif "10%" in m.text: SESS[cid]["discounts_selected"]["first_order"] = True
+    if "РЕЗУЛЬТАТ" in m.text:
+        finalize(cid)
+        return
+
+    if "10%" in m.text: SESS[cid]["discounts_selected"]["first_order"] = True
     elif "пылесос" in m.text: SESS[cid]["discounts_selected"]["provide_vac"] = True
     elif "средства" in m.text: SESS[cid]["discounts_selected"]["provide_cleaners"] = True
     bot.send_message(cid, "Принято! Что-то еще или смотрим результат?")
@@ -288,6 +299,7 @@ def set_hr_h(m):
     finalize(m.chat.id)
 
 def finalize(cid):
+    SESS[cid]["step"] = "result"
     res = calculate_total(cid)
     SESS[cid]["result"] = res
     d = SESS[cid]
@@ -299,11 +311,6 @@ def finalize(cid):
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True).add("✅ Заказать", "🔄 Заново")
     send_safe(cid, text, parse_mode="Markdown", reply_markup=kb)
 
-@bot.message_handler(func=lambda m: m.text == "✅ Заказать")
-def get_contact(m):
-    SESS[m.chat.id]["step"] = "contact"
-    bot.send_message(m.chat.id, "📞 Введите ваш телефон или @username:", reply_markup=types.ReplyKeyboardRemove())
-
 @bot.message_handler(func=lambda m: SESS.get(m.chat.id, {}).get("step") == "contact")
 def finish(m):
     res = SESS[m.chat.id].get("result", {})
@@ -311,9 +318,6 @@ def finish(m):
     send_safe(ADMIN_ID, adm_msg, parse_mode="Markdown")
     bot.send_message(m.chat.id, "✅ Отправлено! Скоро свяжемся.", reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).add("СТАРТ"))
     SESS.pop(m.chat.id, None)
-
-@bot.message_handler(func=lambda m: m.text == "🔄 Заново")
-def restart(m): handle_start(m)
 
 # 7. MAIN LOOP
 async def main():

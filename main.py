@@ -7,21 +7,15 @@ import asyncio
 import logging
 from aiohttp import web
 import time
+from requests.exceptions import ConnectionError as RequestsConnectionError, ReadTimeout
+from urllib3.exceptions import ProtocolError
 
-# ---------- CONFIG ----------
-# Токен и ID теперь берутся строго из переменных окружения для безопасности
-TOKEN = os.environ.get("BOT_TOKEN")
-ADMIN_ID = os.environ.get("ADMIN_ID")
+# ---------- CONFIG (Берем из настроек Render) ----------
+TOKEN = os.environ.get("BOT_TOKEN", "8162969073:AAFH5BPDIWNHqVuzfzbHrqFZsBTxIsmYpK4")
+ADMIN_ID = os.environ.get("ADMIN_ID", "6181649972")
 WHATSAPP_LINK = "https://wa.me/message/WGW3DA5VHIMTG1"
 
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-# aiohttp health server для Render (предотвращает засыпание сервиса)
+# aiohttp health server
 async def health(request):
     return web.Response(text="Cleaning Bot is Live")
 
@@ -33,7 +27,7 @@ async def start_health_server():
     await runner.setup()
     site = web.TCPSite(runner, host='0.0.0.0', port=port)
     await site.start()
-    logger.info(f"Health server running on port {port}")
+    logging.info(f"Health server running on port {port}")
 
 # ---------- ДАННЫЕ И ЦЕНЫ ----------
 MIN_TRAVEL_PER_PERSON = 1200
@@ -66,8 +60,14 @@ EXTRAS = {
     "панорамные окна (1 створка)": {"price": 190, "time": 7.5},
     "остекление парапета (1 м)": {"price": 150, "time": 10},
     "мойка холодильника": {"price": 500, "time": 60},
+    "мойка морозильной камеры": {"price": 200, "time": 30},
     "мойка духовки": {"price": 500, "time": 60},
+    "мойка посудомойки": {"price": 200, "time": 30},
+    "мойка стиральной машины": {"price": 150, "time": 30},
+    "мойка лестничного пролета": {"price": 400, "time": 60},
+    "шторы снять+постирать+повесить (1м)": {"price": 100, "time": 6},
     "глажка (1 час)": {"price": 400, "time": 60},
+    "паровая швабра (1 кв.м.)": {"price": 30, "time": 0.5},
 }
 
 NUM_EXTRA_KEYS = {
@@ -88,10 +88,17 @@ def send_safe(chat_id, text, parse_mode=None, reply_markup=None, max_retries=3):
     for attempt in range(max_retries):
         try:
             return bot.send_message(chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup, disable_web_page_preview=True)
-        except Exception as e:
-            logger.error(f"Error sending message: {e}")
+        except (RequestsConnectionError, ReadTimeout, ProtocolError) as e:
+            logging.warning(f"send_safe retry {attempt+1}/{max_retries} due to network error: {e}")
             time.sleep(0.3)
-    return None
+        except Exception as e:
+            logging.error(f"send_safe aborted due to non-network error: {e}")
+            break
+    try:
+        return bot.send_message(chat_id, text)
+    except Exception as e:
+        logging.error(f"send_safe final failure: {e}")
+        return None
 
 # ---------- ЛОГИКА РАСЧЕТА ----------
 def calculate_total(chat_id):
@@ -123,9 +130,13 @@ def calculate_total(chat_id):
     if layout_key == "2+1":
         layout_key = "2+1_low" if area == "<100 м²" else "2+1_high"
 
-    bathrooms = int(data.get("bathrooms", "1"))
-    balconies = int(data.get("balconies", "1"))
-    rooms_surcharge = (max(0, bathrooms - 1) * 400) + (max(0, balconies - 1) * 200)
+    bathrooms = int(data.get("bathrooms", "1") or 1)
+    balconies = int(data.get("balconies", "1") or 1)
+
+    # Считаем доплату за комнаты заранее (для базы)
+    extra_bath_fee = max(0, bathrooms - 1) * 400
+    extra_balcony_fee = max(0, balconies - 1) * 200
+    rooms_surcharge = extra_bath_fee + extra_balcony_fee
 
     extras_p, extras_t = 0, 0
     for name, qty in data.get("extras", []):
@@ -135,27 +146,37 @@ def calculate_total(chat_id):
     rec_c, rec_h = RECOMM_TABLE.get(layout_key, {}).get(service if service != "После ремонта" else "Генеральная", (1, 4))
     rec_h_total = rec_h + (extras_t / 60 / rec_c)
 
-    base = PRICES.get(layout_key, {}).get(service if service != "После ремонта" else "Генеральная", 0)
-    if service == "После ремонта": base *= 2
+    base_price_key = service if service != "После ремонта" else "Генеральная"
+    base = PRICES.get(layout_key, {}).get(base_price_key, 0)
+    
+    if service == "После ремонта":
+        # Удваиваем базу + допы + доплату за комнаты
+        total_before = (base + extras_p + rooms_surcharge) * 2
+    else:
+        total_before = base + rooms_surcharge + extras_p
 
-    total_base = base + rooms_surcharge + extras_p
-    sel = data.get("discounts_selected", {})
-    disc = 0
-    if sel.get("first_order"): disc += min(total_base * 0.1, 1000)
-    if sel.get("provide_vac"): disc += min(total_base * 0.05, 250)
-    if sel.get("provide_cleaners"): disc += min(total_base * 0.05, 250)
+    discounts = data.get("discounts_selected", {})
+    disc_sum = 0
+    if discounts.get("first_order"): disc_sum += min(total_before * 0.1, 1000)
+    elif discounts.get("second_order"): disc_sum += min(total_before * 0.1, 1000)
+    
+    if discounts.get("provide_vac"): disc_sum += min(total_before * 0.05, 250)
+    if discounts.get("provide_cleaners"): disc_sum += min(total_base * 0.05, 250)
 
+    disc_capped = min(disc_sum, MAX_DISCOUNT_TL)
     dist_f = DISTANCE_FEE.get(data.get("city"), 0) * rec_c
-    final = max(total_base - min(disc, MAX_DISCOUNT_TL), MIN_TRAVEL_PER_PERSON * rec_c) + dist_f
-    return {"total": int(final), "c": rec_c, "h": round(rec_h_total, 1), "dist": int(dist_f), "is_hourly": False}
+    
+    final_total = max(total_before - disc_capped, MIN_TRAVEL_PER_PERSON * rec_c) + dist_f
+    
+    return {"total": int(final_total), "c": rec_c, "h": round(rec_h_total, 1), "dist": int(dist_f), "is_hourly": False}
 
 # ---------- ОБРАБОТЧИКИ (HANDLERS) ----------
 
 @bot.message_handler(commands=["start"])
 def handle_start(m):
-    SESS[m.chat.id] = {"step": "main", "extras": [], "discounts_selected": {}}
+    SESS[m.chat.id] = {"step": "city", "extras": [], "discounts_selected": {}}
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True).add("СТАРТ", "Правила")
-    send_safe(m.chat.id, "👋 Привет! Я Чистюля — бот CleanTeam.\n\nЯ помогу рассчитать стоимость уборки и оформить заказ.", reply_markup=kb)
+    send_safe(m.chat.id, "👋 Привет! Я Чистюля — бот компании CleanTeam.\n\nЯ помогу рассчитать стоимость уборки и оформить заказ.", reply_markup=kb)
 
 @bot.message_handler(func=lambda m: m.text == "Правила")
 def handle_rules(m):
@@ -273,6 +294,7 @@ def show_discounts(cid):
     SESS[cid]["step"] = "discounts"
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1).add(
         "🎁 Скидка 10% (Первый заказ)", 
+        "🎁 Скидка 10% (Второй заказ)",
         "🧹 Свой пылесос (-5%)", 
         "🧼 Свои средства (-5%)", 
         "➡️ ПОКАЗАТЬ РЕЗУЛЬТАТ"
@@ -285,9 +307,20 @@ def handle_disc(m):
     sel = SESS[cid]["discounts_selected"]
     if "РЕЗУЛЬТАТ" in m.text: 
         finalize(cid)
-    elif "10%" in m.text: 
+    elif "Первый заказ" in m.text: 
         sel["first_order"] = True
-        send_safe(cid, "✅ Скидка 10% применена")
+        if sel.get("second_order"): 
+            sel.pop("second_order", None)
+            send_safe(cid, "⚠️ Скидки взаимоисключающие. Применена -10% (Первый).")
+        else:
+            send_safe(cid, "✅ Скидка 10% (Первый) применена")
+    elif "Второй заказ" in m.text:
+        sel["second_order"] = True
+        if sel.get("first_order"): 
+            sel.pop("first_order", None)
+            send_safe(cid, "⚠️ Скидки взаимоисключающие. Применена -10% (Второй).")
+        else:
+            send_safe(cid, "✅ Скидка 10% (Второй) применена")
     elif "пылесос" in m.text: 
         sel["provide_vac"] = True
         send_safe(cid, "✅ Скидка 5% за пылесос применена")

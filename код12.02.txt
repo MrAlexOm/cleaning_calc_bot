@@ -1,0 +1,154 @@
+# Добавь эту ссылку в начало файла к другим CONFIG, если её там нет
+INSTAGRAM_LINK = "https://www.instagram.com/cleanteam.antalya?igsh=amdxcnZlaGRqN3Vl&utm_source=qr"
+
+# ---------- ОБНОВЛЕННАЯ ЛОГИКА РАСЧЕТА И ФИНАЛА ----------
+
+def calculate_total(chat_id):
+    d = SESS.get(chat_id, {})
+    srv = d.get("service_type")
+    
+    # 1. Почасовая
+    if srv == "Почасовая":
+        h, c = int(d.get("hours", 0)), int(d.get("cleaners", 1))
+        total = max(h * c * HOURLY_RATE, MIN_TRAVEL_PER_PERSON * c)
+        dist = DISTANCE_FEE.get(d.get("city"), 0) * c
+        return {"total": int(total + dist), "is_hourly": True, "c": c, "h": h, "discount": 0}
+
+    # 2. Обычная уборка
+    l_key = d.get("layout")
+    # Корректировка ключа планировки (изолированная кухня, 2+1 площадь)
+    if d.get("kitchen_isolated"):
+        if l_key == "1+0": l_key = "1+1"
+        elif l_key and l_key[0].isdigit() and int(l_key[0]) < 5: l_key = f"{int(l_key[0])+1}+1"
+    
+    if l_key == "2+1": 
+        l_key = "2+1_low" if d.get("area") == "<100 м²" else "2+1_high"
+    
+    # База + Комнаты + Допы
+    bath = int(d.get("bathrooms", 1))
+    balc = int(d.get("balconies", 1))
+    rooms_fee = (max(0, bath-1)*400) + (max(0, balc-1)*200)
+    
+    ex_p, ex_t = 0, 0
+    for n, q in d.get("extras", []):
+        ex_p += EXTRAS[n]["price"] * q
+        ex_t += EXTRAS[n]["time"] * q
+        
+    base_k = srv if srv != "После ремонта" else "Генеральная"
+    rec_c, rec_h = RECOMM_TABLE.get(l_key, {}).get(base_k, (1, 4))
+    total_h = rec_h + (ex_t / 60 / rec_c)
+    
+    base_price = PRICES.get(l_key, {}).get(base_k, 0)
+    total_before = base_price + ex_p + rooms_fee
+    
+    if srv == "После ремонта": 
+        total_before *= 2
+    
+    # Скидки
+    ds = d.get("discounts_selected", {})
+    disc = 0
+    if ds.get("first"): disc += min(total_before * 0.1, 1000)
+    if ds.get("vac"): disc += min(total_before * 0.05, 250)
+    
+    # Финал
+    disc_val = min(disc, MAX_DISCOUNT_TL)
+    dist_f = DISTANCE_FEE.get(d.get("city"), 0) * rec_c
+    final = max(total_before - disc_val, MIN_TRAVEL_PER_PERSON * rec_c) + dist_f
+    
+    return {
+        "total": int(final), 
+        "c": rec_c, 
+        "h": round(total_h, 1), 
+        "is_hourly": False,
+        "discount": int(disc_val) # Возвращаем сумму скидки для чека
+    }
+
+# --- ОБНОВЛЕННЫЕ ОБРАБОТЧИКИ ФИНАЛА ---
+
+@bot.message_handler(func=lambda m: SESS.get(m.chat.id, {}).get("step") == "disc")
+def h_fin(m):
+    # Сохраняем скидки, если нажаты
+    if m.text == "Первый заказ": SESS[m.chat.id]["discounts_selected"]["first"] = True
+    
+    # Считаем
+    res = calculate_total(m.chat.id)
+    SESS[m.chat.id]["res"] = res
+    d = SESS[m.chat.id]
+    
+    # ФОРМИРУЕМ ПОДРОБНЫЙ ЧЕК
+    report = ["📋 *РАСЧЕТ СТОИМОСТИ:*"]
+    report.append(f"📍 Город: {d.get('city')}")
+    report.append(f"✨ Услуга: {d.get('service_type')}")
+    
+    if res['is_hourly']:
+        report.append(f"⏳ Часов: {res['h']} | Клинеров: {res['c']}")
+    else:
+        report.append(f"🏠 Объект: {d.get('layout')}")
+        # Кухня
+        k_status = "Изолированная" if d.get('kitchen_isolated') else "Совмещенная"
+        report.append(f"🍽 Кухня: {k_status}")
+        # Комнаты
+        report.append(f"🛁 Санузлов: {d.get('bathrooms')} | 🌅 Балконов: {d.get('balconies')}")
+        
+        # Допы списком
+        if d.get('extras'):
+            report.append("\n➕ *Доп. услуги:*")
+            for name, qty in d.get('extras'):
+                report.append(f" • {name}: {qty} шт.")
+    
+    report.append(f"\n--- --- ---")
+    
+    # Показываем скидку, если она есть
+    if res.get('discount', 0) > 0:
+        report.append(f"🎁 Скидка: -{res['discount']} TL")
+        
+    report.append(f"💰 *ИТОГО: {res['total']} TL*")
+    report.append(f"⏱️ Время: ~{res['h']} ч. | 👥 {res['c']} чел.")
+    
+    full_text = "\n".join(report)
+    SESS[m.chat.id]["report_text"] = full_text # Запоминаем для админа
+
+    bot.send_message(m.chat.id, full_text, parse_mode="Markdown", 
+                     reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).add("✅ Оформить заказ", "🔄 Заново"))
+
+@bot.message_handler(func=lambda m: m.text == "✅ Оформить заказ")
+def h_phone(m):
+    SESS[m.chat.id]["step"] = "phone"
+    bot.send_message(m.chat.id, "📞 Введите ваш телефон или @username для связи:", reply_markup=types.ReplyKeyboardRemove())
+
+@bot.message_handler(func=lambda m: SESS.get(m.chat.id, {}).get("step") == "phone")
+def h_send(m):
+    cid = m.chat.id
+    contact = m.text
+    # Берем сохраненный детальный отчет
+    report = SESS[cid].get("report_text", "Нет данных")
+    
+    # 1. Отправляем АДМИНУ полный расклад
+    adm_msg = f"🔔 *НОВАЯ ЗАЯВКА*\n👤 Контакт: {contact}\n\n{report}"
+    try:
+        bot.send_message(ADMIN_ID, adm_msg, parse_mode="Markdown")
+    except Exception as e:
+        logging.error(f"Admin send error: {e}")
+
+    # 2. Отправляем КЛИЕНТУ подтверждение с кнопками
+    # Используем Inline кнопки для ссылок
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("📸 Наш Instagram (Акции)", url=INSTAGRAM_LINK))
+    kb.add(types.InlineKeyboardButton("💬 Менеджер в WhatsApp", url=WHATSAPP_LINK))
+    
+    success_text = (
+        "✅ *Отправлено! Скоро свяжемся.*\n\n"
+        "Подпишитесь на наш Instagram, чтобы быть в курсе наших акций и предложений!\n"
+        "А если у вас есть вопросы, напишите нашему менеджеру сейчас:"
+    )
+    
+    # Отправляем сообщение с ссылками
+    bot.send_message(cid, success_text, parse_mode="Markdown", reply_markup=kb)
+    
+    # Возвращаем меню старта
+    bot.send_message(cid, "Для нового расчета нажмите кнопку:", 
+                     reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).add("СТАРТ"))
+    SESS.pop(cid, None)
+
+@bot.message_handler(func=lambda m: m.text == "🔄 Заново")
+def restart(m): h_start(m)
